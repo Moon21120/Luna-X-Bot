@@ -22,13 +22,11 @@ LUNA_API_KEY = os.environ.get("LUNA_API_KEY")
 X_CLIENT_ID = os.environ.get("X_CLIENT_ID")
 X_CLIENT_SECRET = os.environ.get("X_CLIENT_SECRET")
 
-# After your first authorization, put the refresh token here.
+# After X gives you a refresh token, put it in Render as:
+# X_REFRESH_TOKEN = <your refresh token>
 X_REFRESH_TOKEN = os.environ.get("X_REFRESH_TOKEN")
 
-# IMPORTANT:
-# Set this to your Render URL + /callback
-#
-# Example:
+# Must exactly match the callback URL configured in X:
 # https://luna-x-bot.onrender.com/callback
 X_REDIRECT_URI = os.environ.get("X_REDIRECT_URI")
 
@@ -36,6 +34,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 # How often Luna checks for new mentions.
 CHECK_INTERVAL = 30
+
 
 # ============================================================
 # STATE
@@ -56,7 +55,7 @@ running = True
 
 
 # ============================================================
-# BASIC HELPERS
+# BASIC HTTP HELPERS
 # ============================================================
 
 def json_request(url, method="GET", headers=None, data=None):
@@ -90,13 +89,18 @@ def json_request(url, method="GET", headers=None, data=None):
 
         print(
             f"[HTTP ERROR] {e.code} {url}\n"
-            f"{error_body}"
+            f"{error_body}",
+            flush=True
         )
 
         raise
 
     except Exception as e:
-        print(f"[REQUEST ERROR] {url}: {e}")
+        print(
+            f"[REQUEST ERROR] {url}: {e}",
+            flush=True
+        )
+
         raise
 
 
@@ -118,6 +122,10 @@ def form_request(url, data, headers=None):
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read().decode("utf-8")
+
+            if not raw:
+                return {}
+
             return json.loads(raw)
 
     except urllib.error.HTTPError as e:
@@ -125,19 +133,20 @@ def form_request(url, data, headers=None):
 
         print(
             f"[HTTP ERROR] {e.code} {url}\n"
-            f"{error_body}"
+            f"{error_body}",
+            flush=True
         )
 
         raise
 
 
+# ============================================================
+# PKCE
+# ============================================================
+
 def base64url(data):
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
-
-# ============================================================
-# OAUTH PKCE
-# ============================================================
 
 def create_pkce():
     verifier = base64url(secrets.token_bytes(32))
@@ -151,6 +160,10 @@ def create_pkce():
     return verifier, challenge
 
 
+# ============================================================
+# X OAUTH
+# ============================================================
+
 def authorization_url():
     global oauth_state
     global oauth_verifier
@@ -163,7 +176,11 @@ def authorization_url():
         "response_type": "code",
         "client_id": X_CLIENT_ID,
         "redirect_uri": X_REDIRECT_URI,
+
+        # offline.access is IMPORTANT because it allows X
+        # to return a refresh token.
         "scope": "tweet.read tweet.write users.read offline.access",
+
         "state": oauth_state,
         "code_challenge": challenge,
         "code_challenge_method": "S256"
@@ -184,7 +201,10 @@ def exchange_code(code):
     global refresh_token
     global token_expires_at
 
-    print("[OAUTH] Exchanging authorization code...")
+    print(
+        "[OAUTH] Exchanging authorization code...",
+        flush=True
+    )
 
     credentials = base64.b64encode(
         f"{X_CLIENT_ID}:{X_CLIENT_SECRET}".encode()
@@ -207,32 +227,86 @@ def exchange_code(code):
         headers
     )
 
-    access_token = result["access_token"]
+    # --------------------------------------------------------
+    # ACCESS TOKEN
+    # --------------------------------------------------------
 
-    refresh_token = result.get(
-        "refresh_token",
-        refresh_token
-    )
+    access_token = result.get("access_token")
+
+    if not access_token:
+        raise RuntimeError(
+            "X did not return an access token."
+        )
+
+    # --------------------------------------------------------
+    # REFRESH TOKEN
+    # --------------------------------------------------------
+
+    returned_refresh_token = result.get("refresh_token")
+
+    if returned_refresh_token:
+        refresh_token = returned_refresh_token
+
+        print(
+            "[OAUTH] Refresh token received: YES",
+            flush=True
+        )
+
+        print()
+        print("=" * 60)
+        print("IMPORTANT - X REFRESH TOKEN")
+        print("=" * 60)
+        print(refresh_token)
+        print("=" * 60)
+        print(
+            "Copy the token above and create this Render variable:"
+        )
+        print()
+        print("X_REFRESH_TOKEN")
+        print("=" * 60)
+        print()
+        print(
+            "SECURITY: Do NOT share this token with anyone.",
+            flush=True
+        )
+
+    else:
+        print(
+            "[OAUTH] Refresh token received: NO",
+            flush=True
+        )
+
+        print(
+            "[OAUTH] X returned an access token, but no refresh token.",
+            flush=True
+        )
+
+        print(
+            "[OAUTH] Make sure offline.access is being requested "
+            "and authorize Luna again.",
+            flush=True
+        )
+
+    # --------------------------------------------------------
+    # EXPIRATION
+    # --------------------------------------------------------
 
     expires_in = result.get("expires_in", 7200)
 
     token_expires_at = time.time() + expires_in
 
-    print("[OAUTH] Authorization successful.")
+    print(
+        f"[OAUTH] Access token received. "
+        f"Expires in approximately {expires_in} seconds.",
+        flush=True
+    )
 
-    if refresh_token:
-        print()
-        print("=" * 60)
-        print("IMPORTANT: YOUR REFRESH TOKEN")
-        print("=" * 60)
-        print(refresh_token)
-        print("=" * 60)
-        print(
-            "Add this as X_REFRESH_TOKEN in Render "
-            "so Luna can stay connected after restarts."
-        )
-        print("=" * 60)
-        print()
+    print(
+        "[OAUTH] Authorization successful.",
+        flush=True
+    )
+
+    return bool(returned_refresh_token)
 
 
 def refresh_access_token():
@@ -241,9 +315,17 @@ def refresh_access_token():
     global token_expires_at
 
     if not refresh_token:
+        print(
+            "[OAUTH] No X_REFRESH_TOKEN is configured.",
+            flush=True
+        )
+
         return False
 
-    print("[OAUTH] Refreshing X access token...")
+    print(
+        "[OAUTH] Refreshing X access token...",
+        flush=True
+    )
 
     credentials = base64.b64encode(
         f"{X_CLIENT_ID}:{X_CLIENT_SECRET}".encode()
@@ -265,38 +347,60 @@ def refresh_access_token():
             headers
         )
 
-        access_token = result["access_token"]
+        access_token = result.get("access_token")
 
-        # X may rotate the refresh token.
-        if result.get("refresh_token"):
-            refresh_token = result["refresh_token"]
+        if not access_token:
+            raise RuntimeError(
+                "X did not return a new access token."
+            )
+
+        # X can rotate refresh tokens.
+        new_refresh_token = result.get("refresh_token")
+
+        if new_refresh_token:
+            refresh_token = new_refresh_token
 
             print()
-            print("[OAUTH] X rotated the refresh token.")
-            print("Update X_REFRESH_TOKEN in Render with:")
+            print("=" * 60)
+            print("[OAUTH] X ROTATED THE REFRESH TOKEN")
+            print("=" * 60)
             print(refresh_token)
+            print("=" * 60)
+            print(
+                "Update X_REFRESH_TOKEN in Render with "
+                "the new token above."
+            )
+            print("=" * 60)
             print()
 
         expires_in = result.get("expires_in", 7200)
 
         token_expires_at = time.time() + expires_in
 
-        print("[OAUTH] Token refreshed.")
+        print(
+            "[OAUTH] Token refreshed successfully.",
+            flush=True
+        )
 
         return True
 
     except Exception as e:
-        print(f"[OAUTH] Refresh failed: {e}")
+        print(
+            f"[OAUTH] Refresh failed: {e}",
+            flush=True
+        )
+
         return False
 
 
 def ensure_access_token():
     global access_token
 
-    # Refresh a little before expiration.
+    # Current token is still valid.
     if access_token and time.time() < token_expires_at - 120:
         return True
 
+    # Try the refresh token.
     if refresh_token:
         return refresh_access_token()
 
@@ -309,7 +413,9 @@ def ensure_access_token():
 
 def x_get(url, params=None):
     if not ensure_access_token():
-        raise RuntimeError("Luna is not authorized with X yet.")
+        raise RuntimeError(
+            "Luna is not authorized with X yet."
+        )
 
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -326,10 +432,7 @@ def x_get(url, params=None):
         )
 
     except urllib.error.HTTPError as e:
-
-        # Try refreshing once if the token expired.
         if e.code == 401 and refresh_access_token():
-
             headers = {
                 "Authorization": f"Bearer {access_token}"
             }
@@ -345,7 +448,9 @@ def x_get(url, params=None):
 
 def x_post(url, data):
     if not ensure_access_token():
-        raise RuntimeError("Luna is not authorized with X yet.")
+        raise RuntimeError(
+            "Luna is not authorized with X yet."
+        )
 
     headers = {
         "Authorization": f"Bearer {access_token}"
@@ -360,9 +465,7 @@ def x_post(url, data):
         )
 
     except urllib.error.HTTPError as e:
-
         if e.code == 401 and refresh_access_token():
-
             headers = {
                 "Authorization": f"Bearer {access_token}"
             }
@@ -392,9 +495,14 @@ def get_luna_account():
 
     print(
         f"[X] Connected as @{luna_username} "
-        f"(ID: {luna_user_id})"
+        f"(ID: {luna_user_id})",
+        flush=True
     )
 
+
+# ============================================================
+# MENTIONS
+# ============================================================
 
 def get_mentions():
     params = {
@@ -415,8 +523,7 @@ def get_mentions():
 
 
 def reply_to_tweet(tweet_id, text):
-    # X posts have a character limit.
-    # Keep Luna's response safely within it.
+    # Keep Luna's reply safely within X's character limit.
     if len(text) > 275:
         text = text[:272] + "..."
 
@@ -432,7 +539,10 @@ def reply_to_tweet(tweet_id, text):
         data
     )
 
-    print(f"[X] Replied to {tweet_id}")
+    print(
+        f"[X] Replied to {tweet_id}",
+        flush=True
+    )
 
     return result
 
@@ -442,7 +552,10 @@ def reply_to_tweet(tweet_id, text):
 # ============================================================
 
 def ask_luna(message):
-    print(f"[LUNA] Sending: {message}")
+    print(
+        f"[LUNA] Sending: {message}",
+        flush=True
+    )
 
     headers = {
         "Authorization": f"Bearer {LUNA_API_KEY}"
@@ -502,17 +615,17 @@ def process_mentions():
         if not tweets:
             return
 
-        # API normally returns newest first.
+        # X normally returns newest first.
         tweets = list(reversed(tweets))
 
         for tweet in tweets:
-
             tweet_id = tweet["id"]
 
             if last_mention_id:
                 try:
                     if int(tweet_id) <= int(last_mention_id):
                         continue
+
                 except Exception:
                     pass
 
@@ -520,14 +633,16 @@ def process_mentions():
 
             message = clean_mention(text)
 
-            # Ignore empty mentions.
             if not message:
-                message = "Someone mentioned you without a message."
+                message = (
+                    "Someone mentioned you without a message."
+                )
 
             print()
             print(
                 f"[MENTION] @{luna_username}: "
-                f"{message}"
+                f"{message}",
+                flush=True
             )
 
             try:
@@ -541,13 +656,17 @@ def process_mentions():
             except Exception as e:
                 print(
                     f"[ERROR] Failed processing "
-                    f"{tweet_id}: {e}"
+                    f"{tweet_id}: {e}",
+                    flush=True
                 )
 
             last_mention_id = tweet_id
 
     except Exception as e:
-        print(f"[MENTIONS] {e}")
+        print(
+            f"[MENTIONS] {e}",
+            flush=True
+        )
 
 
 # ============================================================
@@ -597,11 +716,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/":
 
-            status = (
-                "Connected"
-                if access_token
-                else "Waiting for X authorization"
-            )
+            if access_token:
+                status = "Connected to X"
+            elif refresh_token:
+                status = "Refresh token configured"
+            else:
+                status = "Waiting for X authorization"
 
             self.send_page(
                 200,
@@ -610,9 +730,12 @@ class Handler(BaseHTTPRequestHandler):
                 <head>
                     <title>Luna X Bot</title>
                 </head>
+
                 <body>
                     <h1>Luna X Bot</h1>
+
                     <p>Status: {status}</p>
+
                     <p>
                         <a href="/auth">
                             Connect Luna to X
@@ -718,18 +841,68 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
 
-                exchange_code(code)
+                got_refresh_token = exchange_code(code)
 
                 get_luna_account()
+
+                if got_refresh_token:
+
+                    refresh_message = """
+                    <p>
+                        <strong>✓ Refresh token received!</strong>
+                    </p>
+
+                    <p>
+                        Open your Render logs and copy the
+                        refresh token into:
+                    </p>
+
+                    <p>
+                        <strong>X_REFRESH_TOKEN</strong>
+                    </p>
+                    """
+
+                else:
+
+                    refresh_message = """
+                    <p>
+                        <strong>
+                            ⚠ X did NOT return a refresh token.
+                        </strong>
+                    </p>
+
+                    <p>
+                        The authorization itself worked, but
+                        Luna needs a refresh token to stay
+                        connected after the access token expires.
+                    </p>
+
+                    <p>
+                        Check the Render logs for:
+                        <br>
+                        <strong>
+                            [OAUTH] Refresh token received: NO
+                        </strong>
+                    </p>
+
+                    <p>
+                        Make sure the authorization request includes
+                        <strong>offline.access</strong>, then
+                        authorize Luna again.
+                    </p>
+                    """
 
                 self.send_page(
                     200,
                     f"""
                     <html>
+
                     <head>
                         <title>Luna Connected</title>
                     </head>
+
                     <body>
+
                         <h1>✓ Luna is connected!</h1>
 
                         <p>
@@ -743,13 +916,10 @@ class Handler(BaseHTTPRequestHandler):
                             Luna can now monitor mentions.
                         </p>
 
-                        <p>
-                            Check your Render logs for the
-                            refresh token and add it as
-                            <strong>X_REFRESH_TOKEN</strong>
-                            in your environment variables.
-                        </p>
+                        {refresh_message}
+
                     </body>
+
                     </html>
                     """
                 )
@@ -760,6 +930,7 @@ class Handler(BaseHTTPRequestHandler):
                     500,
                     f"""
                     <h1>Authorization error</h1>
+
                     <pre>{e}</pre>
                     """
                 )
@@ -781,6 +952,7 @@ class Handler(BaseHTTPRequestHandler):
 # ============================================================
 
 def start_web_server():
+
     server = HTTPServer(
         ("0.0.0.0", PORT),
         Handler
@@ -788,7 +960,8 @@ def start_web_server():
 
     print(
         f"[WEB] Luna X OAuth server running "
-        f"on port {PORT}"
+        f"on port {PORT}",
+        flush=True
     )
 
     server.serve_forever()
@@ -800,27 +973,42 @@ def start_web_server():
 
 def main():
 
-    print("=" * 60)
-    print("LUNA X BOT")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("LUNA X BOT", flush=True)
+    print("=" * 60, flush=True)
 
     if not LUNA_API_KEY:
-        print("ERROR: LUNA_API_KEY is missing.")
+        print(
+            "ERROR: LUNA_API_KEY is missing.",
+            flush=True
+        )
         return
 
     if not X_CLIENT_ID:
-        print("ERROR: X_CLIENT_ID is missing.")
+        print(
+            "ERROR: X_CLIENT_ID is missing.",
+            flush=True
+        )
         return
 
     if not X_CLIENT_SECRET:
-        print("ERROR: X_CLIENT_SECRET is missing.")
+        print(
+            "ERROR: X_CLIENT_SECRET is missing.",
+            flush=True
+        )
         return
 
     if not X_REDIRECT_URI:
-        print("ERROR: X_REDIRECT_URI is missing.")
+        print(
+            "ERROR: X_REDIRECT_URI is missing.",
+            flush=True
+        )
         return
 
-    # Start the OAuth/web server.
+    # --------------------------------------------------------
+    # START WEB SERVER
+    # --------------------------------------------------------
+
     web_thread = threading.Thread(
         target=start_web_server,
         daemon=True
@@ -829,12 +1017,28 @@ def main():
     web_thread.start()
 
     print()
-    print("[WEB] Open your Render service URL")
-    print("and add /auth to authorize Luna.")
+    print(
+        "[WEB] Open your Render service URL",
+        flush=True
+    )
+
+    print(
+        "[WEB] Add /auth to authorize Luna with X.",
+        flush=True
+    )
+
     print()
 
-    # If already authorized, connect immediately.
+    # --------------------------------------------------------
+    # EXISTING REFRESH TOKEN
+    # --------------------------------------------------------
+
     if refresh_token:
+
+        print(
+            "[X] X_REFRESH_TOKEN is configured.",
+            flush=True
+        )
 
         try:
             get_luna_account()
@@ -842,14 +1046,33 @@ def main():
         except Exception as e:
 
             print(
-                f"[X] Existing authorization failed: {e}"
+                f"[X] Existing authorization failed: {e}",
+                flush=True
             )
 
             print(
-                "[X] Visit /auth to authorize again."
+                "[X] Visit /auth to authorize again.",
+                flush=True
             )
 
-    # Main mention loop.
+    else:
+
+        print(
+            "[X] No X_REFRESH_TOKEN configured yet.",
+            flush=True
+        )
+
+        print(
+            "[X] Visit /auth to connect Luna to X.",
+            flush=True
+        )
+
+    print()
+
+    # --------------------------------------------------------
+    # MAIN MENTION LOOP
+    # --------------------------------------------------------
+
     while running:
 
         if access_token:
@@ -858,12 +1081,27 @@ def main():
 
         else:
 
-            print(
-                "[X] Waiting for authorization..."
-            )
+            # If a refresh token exists, try connecting.
+            if refresh_token:
+                try:
+                    get_luna_account()
+                except Exception as e:
+                    print(
+                        f"[X] Waiting for authorization: {e}",
+                        flush=True
+                    )
+            else:
+                print(
+                    "[X] Waiting for X authorization...",
+                    flush=True
+                )
 
         time.sleep(CHECK_INTERVAL)
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
